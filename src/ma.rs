@@ -1,0 +1,3 @@
+// Moving average support.
+
+
