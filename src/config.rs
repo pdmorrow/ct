@@ -1,38 +1,50 @@
-use crate::strategy;
 use ini::Ini;
 use log::{debug, log_enabled, Level::Debug};
 use std::collections::HashMap;
 
 #[derive(Debug)]
+pub struct StrategyConfig {
+    pub members: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
 pub struct ExchangeConfig {
     pub name: String,
     pub uri: String,
+    pub version: String,
+    pub margin_version: String,
     pub apikey: String,
+    pub secretkey: String,
     pub endpoints_map: HashMap<String, String>,
 }
 
 #[derive(Debug)]
 pub struct Config {
-    pub exchange: ExchangeConfig,
-    pub dryrun: bool,
-    pub strategies: strategy::StrategyTypes,
+    pub log_level: String,
+    pub strategy: StrategyConfig,
 }
 
-pub fn new(cfg_file_path: &String) -> Config {
+impl Config {
+    pub fn get_strategy(&self) -> &StrategyConfig {
+        &self.strategy
+    }
+}
+
+pub fn new(cfg_file_path: &String) -> (Config, ExchangeConfig) {
     let inifile = match Ini::load_from_file("conf/ct.ini") {
         Ok(ini) => ini,
 
         Err(e) => {
-            panic!("failed to load config file {:?}: {:?}", cfg_file_path, e);
+            panic!("failed to load config file {:#?}: {:#?}", cfg_file_path, e);
         }
     };
 
     if log_enabled!(Debug) {
         debug!("configuration file: ");
         for (section, prop) in inifile.iter() {
-            debug!("[{:?}]", section);
+            debug!("[{:#?}]", section);
             for (k, v) in prop.iter() {
-                debug!("{:?}={:?}", k, v);
+                debug!("{:#?}={:#?}", k, v);
             }
         }
     }
@@ -47,11 +59,6 @@ pub fn new(cfg_file_path: &String) -> Config {
         None => panic!("required section \"Exchange\" not found!"),
     };
 
-    let strat_section = match inifile.section(Some("Strategies")) {
-        Some(s) => s,
-        None => panic!("required section \"Strategies\" not found!"),
-    };
-
     let exchange_name = match exchange_section.get("Name") {
         Some(en) => en,
         None => panic!("section \"Exchange\" missing required \"Name\" entry"),
@@ -62,9 +69,24 @@ pub fn new(cfg_file_path: &String) -> Config {
         None => panic!("section \"Exchange\" missing required \"URI\" entry"),
     };
 
+    let version = match exchange_section.get("Version") {
+        Some(u) => u,
+        None => panic!("section \"Exchange\" missing required \"Version\" entry"),
+    };
+
+    let margin_version = match exchange_section.get("MarginVersion") {
+        Some(u) => u,
+        None => panic!("section \"Exchange\" missing required \"MarginVersion\" entry"),
+    };
+
     let apikey = match exchange_section.get("APIKey") {
         Some(ak) => ak,
         None => panic!("section \"Exchange\" missing required \"APIKey\" entry"),
+    };
+
+    let skey = match exchange_section.get("SecretKey") {
+        Some(sk) => sk,
+        None => panic!("section \"Exchange\" missing required \"SecretKey\" entry"),
     };
 
     // Read each endpoint entry and add to the hashmap of rest endpoints.
@@ -84,40 +106,38 @@ pub fn new(cfg_file_path: &String) -> Config {
     }
 
     // Parse [Manager] section, these are global options.
-    //
-    // dryrun indicates whether we actually trade or not.
-    let dryrun = match manager_section.get("Dryrun") {
-        Some(v) => {
-            if v.eq_ignore_ascii_case("true") {
-                true
-            } else if v.eq_ignore_ascii_case("yes") {
-                true
-            } else {
-                false
-            }
-        }
+    let log_level = match manager_section.get("Log") {
+        Some(v) => v.to_ascii_lowercase(),
 
-        None => false,
+        None => "info".to_string(),
     };
 
-    // Parse [Strategies] section.
-    let enabled_strats = match strat_section.get("Enabled") {
-        Some(es) => es,
-        None => panic!("section \"Strategies\" missing required \"Enabled\" entry"),
+    // Parse [Strategy] section.
+    let strategy_section = match inifile.section(Some("Strategy")) {
+        Some(s) => s,
+        None => panic!("required section \"Strategy\" not found!"),
     };
 
-    // Enabled is a comma separated list of enabled strategies.
-    let strat_bitmask = strategy::from_str_cs(enabled_strats);
+    let mut sc = StrategyConfig {
+        members: HashMap::with_capacity(strategy_section.len()),
+    };
+    for (k, v) in strategy_section.iter() {
+        sc.members.insert(String::from(k), String::from(v));
+    }
 
-    Config {
-        exchange: ExchangeConfig {
+    (
+        Config {
+            strategy: sc,
+            log_level: log_level,
+        },
+        ExchangeConfig {
             name: exchange_name.to_string(),
             uri: uri.to_string(),
+            version: version.to_string(),
+            margin_version: margin_version.to_string(),
             apikey: apikey.to_string(),
+            secretkey: skey.to_string(),
             endpoints_map: endpoints_map,
         },
-        
-        strategies: strat_bitmask,
-        dryrun: dryrun,
-    }
+    )
 }

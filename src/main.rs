@@ -1,53 +1,33 @@
+mod account;
+mod balance;
 mod binance;
+mod candlestick;
 mod config;
-mod exchange;
-mod strategy;
+mod exchangeinfo;
+mod ma;
+mod margin;
+mod order;
+mod orderbook;
+mod position;
 mod price;
+mod process_md;
+mod trading;
+mod tradingpair;
+mod utils;
 
-use binance::Binance;
-use exchange::Exchange;
-use config::Config;
-use flexi_logger::{detailed_format, Age, Cleanup, Criterion, Duplicate, Logger, Naming};
-use log::info;
-
-fn run_strategies(cfg: &Config, ex: &dyn exchange::Exchange) {
-}
+use log::debug;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    Logger::with_str("info")
-        .log_to_file()
-        .directory("logs")
-        .format(detailed_format)
-        .duplicate_to_stdout(Duplicate::Info)
-        .create_symlink("current.log")
-        .rotate(
-            Criterion::Age(Age::Day),
-            Naming::Timestamps,
-            Cleanup::KeepLogFiles(7),
-        )
-        .start()?;
-
-    info!("starting up...");
-
     let config_file = "conf/ct.ini".to_string();
-    let config = config::new(&config_file);
-    info!("loaded configuration from {:?}.", config_file);
-
-    let exchange_config = config.exchange;
-    let bex: Binance = Exchange::new(Box::new(exchange_config));
-
-    let conn = bex.test_connectivity();
-
-    info!(
-        "exchange {:?} connection test: {:?} ",
-        bex.config.name, conn
+    let (global_config, exchange_config) = config::new(&config_file);
+    utils::init_logging("/var/log/crypto-trader", &global_config.log_level);
+    debug!(
+        "loaded configuration {:#?} from {:#?}.",
+        global_config, config_file
     );
 
-    if conn == true {
-        // Run forever or until we get a signal to exit.
-        run_strategies(&config, &bex);
-    }
-    
+    let strat_cfg = global_config.get_strategy();
+    process_md::run_strategy(strat_cfg, &exchange_config);
 
     Ok(())
 }
