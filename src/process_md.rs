@@ -1,39 +1,33 @@
 // Process market data (process_md.rs).
+use crate::account_manager;
 use crate::binance;
+use crate::candlestick;
 use crate::config;
 use crate::ma;
 use crate::order;
 use crate::position;
-use crate::trading;
 use crate::tradingpair;
 
+use math::round;
 use std::collections::HashMap;
-use std::sync::mpsc;
-use std::{thread, time};
-use websocket::{ClientBuilder, OwnedMessage};
+use std::{thread, time::Duration};
+use websocket::{stream::sync::NetworkStream, sync::Client, ClientBuilder, OwnedMessage};
 
 use serde_json;
 
 use log::{debug, error, info};
 
+use account_manager::{AccountManager, OrderQuantity};
 use binance::Binance;
 use config::{ExchangeConfig, StrategyConfig};
 use position::PositionType;
 use tradingpair::TradingPair;
 
 #[derive(Debug, Copy, Clone, PartialEq)]
-enum TradeSignal {
+pub enum TradeSignal {
     MaCross,
     MaTrendReversal,
     MACD,
-}
-
-#[derive(Debug, Clone)]
-pub struct TradeThreadMsg {
-    pub trade_action: Option<PositionType>, // Long, Short or None.
-    pub trading_pair: Option<TradingPair>,  // The asset the message relates to.
-    pub quit: bool,                         // Can be set to true to exit the trading thread.
-    pub closing_price: f64,                 // Last candlestick closing price.
 }
 
 #[derive(Debug)]
@@ -42,146 +36,287 @@ pub struct MarketDataTracker {
     pub fast_ma_data: ma::MAData,
     pub macd: ma::MACD,
 
-    pub ma_cross_signal: PositionType,
-    pub ma_trend_change_signal: PositionType,
-    pub macd_signal: PositionType,
+    pub desired_position: PositionType,
 
-    // The overall decision if using a combination of the above signals.
-    pub merged_signal: PositionType,
+    // The signal type we are looking for.
+    pub trade_signal: TradeSignal,
+
+    // Previous candles, green or red?
+    pub candle_color_history: Vec<candlestick::CandleColor>,
+
+    // Exponential or simple MA.
+    pub ema: bool,
+
+    // Are we using BLVTs or not?
+    pub bvlt: bool,
+
+    // Market/Limit?
+    pub order_type: order::OrderType,
+
+    // % Away from the last close price we'll accept for a limit order.
+    pub limit_offset: Option<u8>,
+
+    // % Away from the average fill price that we want to set our stop loss at.
+    pub stop_percent: Option<f64>,
+
+    // % Gain we are happy to take a profit at.
+    pub take_profit_percent: Option<f64>,
+
+    // If trade_signal is TradeSignal::MACD then we want this number of green
+    // candle before entering a position even if the signal has been triggered.
+    // Same goes in the reverse direction for red candles.
+    pub confirmation_candles: Option<u8>,
+
+    // If we are using the macd as the primary indicator we might also have a
+    // trend MA we need to be above in order to take a long position.
+    pub macd_trend_ma: ma::MAData,
 }
 
-// The number of ticks away from the last closing price that we will
-// accept
+// The number of ticks away from the last closing price that we will accept.
 static DEFAULT_LIMIT_RANGE: u8 = 2;
 
-// Compute the latest moving averages then check if we have a trade signal.
-// If we do then signal to the trading thread. In BVLT mode we continuously
-// send moving average data to the trading thread since those values are used
-// as stop loss values.
-fn process_close_data(
+// Check & update if the last required number of candles are all green or all red.
+fn trade_confirmation_via_previous_candles(
+    mt: &mut MarketDataTracker,
+    closing_price: f64,
+    prev_closing_price: Option<f64>,
+) -> Option<(bool, candlestick::CandleColor)> {
+    if mt.confirmation_candles.is_some() {
+        if let Some(prev_closing_price) = prev_closing_price {
+            let num_confirmations = mt.confirmation_candles.unwrap();
+            if num_confirmations as usize == mt.candle_color_history.capacity() {
+                mt.candle_color_history.pop();
+            }
+
+            if prev_closing_price <= closing_price {
+                mt.candle_color_history
+                    .push(candlestick::CandleColor::GREEN);
+            } else {
+                mt.candle_color_history.push(candlestick::CandleColor::RED);
+            }
+
+            Some((
+                mt.candle_color_history
+                    .iter()
+                    .all(|&color| color == mt.candle_color_history[0]),
+                mt.candle_color_history[0],
+            ))
+        } else {
+            // Color here doesn't matter.
+            Some((false, candlestick::CandleColor::GREEN))
+        }
+    } else {
+        None
+    }
+}
+
+// Decide what we should do based on:
+//
+// TA
+// Take profit override
+// Current position
+// Any extra confirmation signals
+fn trading_decision(
+    am: &AccountManager,
     trading_pair: &TradingPair,
     mt: &mut MarketDataTracker,
     closing_price: f64,
-    tx_channel: Option<&mpsc::Sender<TradeThreadMsg>>,
-    ma_mode: ma::MAMode,
-    ema: bool,
-    signals: &Vec<TradeSignal>,
-) {
-    // Update MAs.
-    mt.slow_ma_data.compute(closing_price, ema);
-    mt.fast_ma_data.compute(closing_price, ema);
+    prev_closing_price: Option<f64>,
+) -> position::PositionType {
+    let mut decision = PositionType::None;
 
-    // Update MACD.
-    mt.macd.compute(closing_price);
-
-    let tx_channel = tx_channel.unwrap();
-
-    // Enqueue a message to the trading thead to make a trade if there
-    // is a signal.
     if trading_pair.get_bvlt_type().is_none() {
-        assert!(ma_mode == ma::MAMode::BVLT || ma_mode == ma::MAMode::BASIC);
+        decision = match mt.trade_signal {
+            TradeSignal::MaCross => ma::trading_decision_ma_cross(&trading_pair, mt, closing_price),
+            TradeSignal::MaTrendReversal => {
+                ma::trading_decision_ma_trend_change(&trading_pair, mt, closing_price)
+            }
+            TradeSignal::MACD => ma::trading_decision_macd(&trading_pair, mt, closing_price),
+        };
 
-        // Check that all signals are satisfied.
-        let decisions: Vec<PositionType> = signals
-            .iter()
-            .map(|sig| match sig {
-                TradeSignal::MaCross => ma::trading_decision_ma_cross(&trading_pair, mt),
-                TradeSignal::MaTrendReversal => {
-                    ma::trading_decision_ma_trend_change(&trading_pair, mt)
+        // Update the list of previous candle colours and return if we've matched a number in
+        // a row which are the same colour.
+        let confirmation =
+            trade_confirmation_via_previous_candles(mt, closing_price, prev_closing_price);
+
+        // Check if we have confirmations in the right direction.
+        let confirmed = if confirmation.is_some() {
+            let confirmation = confirmation.unwrap();
+            if decision == PositionType::Long {
+                if confirmation.1 == candlestick::CandleColor::GREEN {
+                    confirmation.0
+                } else {
+                    false
                 }
-                TradeSignal::MACD => ma::trading_decision_macd(&trading_pair, mt),
-            })
-            .collect();
+            } else if decision == PositionType::Short {
+                if confirmation.1 == candlestick::CandleColor::RED {
+                    confirmation.0
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            // We don't need extra confirmation, just go for it.
+            true
+        };
 
-        let decision = &decisions[0];
-        for d in &decisions {
-            if d != decision {
-                // Not all decisions matched
-                return;
+        // Check if we have any open positions at the moment.
+        let cur_position = am.get_position(trading_pair.symbol());
+        let cur_position_type = match cur_position {
+            Some((r#type, _, _)) => r#type,
+            None => PositionType::None,
+        };
+
+        // Maybe override the signals if we hit a profit target.
+        let take_profit_override = if mt.take_profit_percent.is_some() {
+            match cur_position {
+                Some((r#type, _qty, price)) => {
+                    if r#type == PositionType::Long
+                        && (closing_price
+                            >= (price + ((price / 100.0) * mt.take_profit_percent.unwrap())))
+                    {
+                        true
+                    } else {
+                        false
+                    }
+                }
+
+                None => false,
+            }
+        } else {
+            false
+        };
+
+        if take_profit_override {
+            if cur_position_type == PositionType::Long {
+                decision = PositionType::Short;
+                info!(
+                    "{:#?} take profit hit: close price: {}, +{}% from entry, will sell",
+                    trading_pair.symbol(),
+                    closing_price,
+                    mt.take_profit_percent.unwrap(),
+                );
             }
         }
 
-        if mt.merged_signal == *decision {
-            // No change since last time.
-            debug!(
-                "{:#?} trade decision is unchanged: {:#?}",
-                trading_pair.symbol(),
-                decision
-            );
-            return;
-        } else if *decision != PositionType::None {
+        if decision == cur_position_type {
+            decision = PositionType::None;
+        } else if (confirmed || take_profit_override) && decision != PositionType::None {
             info!(
                 "{:#?} trade decision changed: {:#?} --> {:#?}",
                 trading_pair.symbol(),
-                mt.merged_signal,
+                cur_position_type,
                 decision
             );
-            mt.merged_signal = *decision;
         }
+    }
 
-        match decision {
-            PositionType::None => {}
-            PositionType::Short | PositionType::Long => {
-                let msg = TradeThreadMsg {
-                    trade_action: Some(*decision),
-                    trading_pair: Some(trading_pair.clone()),
-                    quit: false,
-                    closing_price: closing_price,
-                };
-                match tx_channel.send(msg) {
-                    Ok(_) => {}
-                    Err(e) => {
-                        error!(
-                            "{:#?} failed to send decision msg to trading thread: {:#?}",
-                            trading_pair.symbol(),
-                            e
-                        );
-                    }
-                }
+    return decision;
+}
+
+// Update all required TA indicators and check if we should make a trade, if we should
+// then we submit an order to the AccountManager.
+fn process_close_data(
+    am: &AccountManager,
+    trading_pair: &TradingPair,
+    mt: &mut MarketDataTracker,
+    closing_price: f64,
+    prev_closing_price: Option<f64>,
+    place_trades: bool,
+) {
+    // Compute the various technical indicators.
+    match mt.trade_signal {
+        TradeSignal::MaCross => {
+            mt.slow_ma_data.compute(closing_price, mt.ema);
+            mt.fast_ma_data.compute(closing_price, mt.ema);
+        }
+        TradeSignal::MaTrendReversal => {
+            mt.fast_ma_data.compute(closing_price, mt.ema);
+        }
+        TradeSignal::MACD => {
+            mt.macd.compute(closing_price);
+
+            if mt.macd_trend_ma.num_candles > 0 {
+                mt.macd_trend_ma.compute(closing_price, mt.ema);
             }
         }
-    } else {
-        // This is one of the bvlt trading pairs (UP or DOWN), just send
-        // the latest slow moving average value along with the associated
-        // trading pair.
-        assert!(ma_mode == ma::MAMode::BVLT);
+    }
 
-        if mt.slow_ma_data.latest().is_some() {
-            let msg = TradeThreadMsg {
-                trade_action: None,
-                trading_pair: Some(trading_pair.clone()),
-                quit: false,
-                closing_price: closing_price,
+    if !place_trades {
+        // If we just want to process the data then return now.
+        return;
+    }
+
+    // Based on the latest TA and currently active position, compute the best new
+    // position for us to take.
+    let decision = trading_decision(am, trading_pair, mt, closing_price, prev_closing_price);
+
+    match decision {
+        PositionType::None => {}
+        PositionType::Short | PositionType::Long => {
+            // Compute the limit prices we are willing to accept for BUY/SELL orders.
+            let limit_price = if mt.order_type == order::OrderType::Limit {
+                let tick_increment = trading_pair.get_tick_size();
+                if decision == PositionType::Long {
+                    Some(round::floor(
+                        closing_price
+                            + (tick_increment
+                                * mt.limit_offset
+                                    .expect("limit offset is None but this is a limit order")
+                                    as f64),
+                        trading_pair.get_price_dps(),
+                    ))
+                } else {
+                    Some(round::floor(
+                        closing_price
+                            - (tick_increment
+                                * mt.limit_offset
+                                    .expect("limit offset is None but this is a limit order")
+                                    as f64),
+                        trading_pair.get_price_dps(),
+                    ))
+                }
+            } else {
+                // Using MARKET orders.
+                None
             };
 
-            match tx_channel.send(msg) {
-                Ok(_) => {}
-                Err(e) => {
-                    error!(
-                        "{:#?} failed to send blvt ma msg to trading thread: {:#?}",
-                        trading_pair.symbol(),
-                        e
-                    );
-                }
-            }
+            // Submit an order.
+            am.spot_trade(
+                trading_pair.clone(),
+                decision,
+                OrderQuantity::Percentage100,
+                limit_price,
+                mt.stop_percent,
+            );
         }
     }
 }
 
-// Send a quit message to the trading thread.
-fn exit_trading_thread(tx_channel: &mpsc::Sender<TradeThreadMsg>) {
-    let msg = TradeThreadMsg {
-        trade_action: None,
-        trading_pair: None,
-        quit: true,
-        closing_price: 0.0,
-    };
-    match tx_channel.send(msg) {
-        Ok(_) => {}
-        Err(e) => {
-            error!("failed to send quit msg to trading thread: {:#?}", e);
+// Reconnect to the websocket stream.
+fn reconnect_stream(
+    ws_client: &mut ClientBuilder,
+) -> Option<Client<Box<dyn NetworkStream + std::marker::Send>>> {
+    let mut cur_try = 0;
+    let max_tries = 5;
+    while cur_try < max_tries {
+        cur_try += 1;
+        if let Ok(c) = ws_client.connect(None) {
+            c.stream_ref()
+                .as_tcp()
+                .set_read_timeout(Some(Duration::new(60 * 1, 0)))
+                .expect("failed to set read timeout");
+            info!("connected to kline stream");
+            return Some(c);
+        } else {
+            error!("failed to reconnect to kline stream");
+            thread::sleep(Duration::from_millis(5000 * cur_try));
         }
     }
+
+    None
 }
 
 // Process market data for the given trading pair and time frame, this processing
@@ -189,58 +324,88 @@ fn exit_trading_thread(tx_channel: &mpsc::Sender<TradeThreadMsg>) {
 // thread.
 fn process_market_data_thread(
     ec: ExchangeConfig,
+    log_dir: String,
     tp: TradingPair,
     time_frame: String,
-    slow_ma: u16,
-    fast_ma: u16,
-    tx_channel: mpsc::Sender<TradeThreadMsg>,
-    ma_mode: ma::MAMode,
+    slow_ma: Option<u16>,
+    fast_ma: Option<u16>,
+    bvlt: bool,
     ema: bool,
-    signals: Vec<TradeSignal>,
+    signal: TradeSignal,
+    order_type: order::OrderType,
+    limit_offset: Option<u8>,
+    stop_percent: Option<f64>,
+    take_profit_percent: Option<f64>,
+    confirmation_candles: Option<u8>,
+    macd_trend_ma: Option<u16>,
 ) {
     info!(
-        "starting {}ma compute thread for:\n\n{:#?} using time frame: {:#?}, slow sticks: {:#?}, fast sticks: {:#?}",
+        "starting {}ma compute thread for {:#?} using time frame {:#?} slow ma: {:#?}, fast ma {:#?}, signal: {:#?}",
         if ema { "e" } else { "s" },
-        tp,
+        tp.symbol(),
         time_frame,
         slow_ma,
-        fast_ma
+        fast_ma,
+        signal,
     );
 
+    let mut prev_closing_price: Option<f64> = None;
+    let ec_am = ec.clone();
     let bex = Binance::new(ec);
-
+    let am = AccountManager::new(ec_am, false, log_dir);
     let mut mt = MarketDataTracker {
-        slow_ma_data: ma::MAData::new(slow_ma),
-        fast_ma_data: ma::MAData::new(fast_ma),
+        slow_ma_data: ma::MAData::new(slow_ma.unwrap_or(0)),
+        fast_ma_data: ma::MAData::new(fast_ma.unwrap_or(0)),
         macd: ma::MACD::new(),
-        ma_cross_signal: PositionType::None,
-        ma_trend_change_signal: PositionType::None,
-        macd_signal: PositionType::None,
-        merged_signal: PositionType::None,
+        desired_position: PositionType::None,
+        candle_color_history: Vec::with_capacity(confirmation_candles.unwrap_or(0) as usize),
+        ema: ema,
+        bvlt: bvlt,
+        trade_signal: signal,
+        order_type: order_type,
+        limit_offset: limit_offset,
+        stop_percent: stop_percent,
+        take_profit_percent: take_profit_percent,
+        confirmation_candles: confirmation_candles,
+        macd_trend_ma: ma::MAData::new(macd_trend_ma.unwrap_or(0)),
     };
 
     let mut req_params: HashMap<&str, &str> = HashMap::with_capacity(3);
     req_params.insert("symbol", tp.symbol());
     req_params.insert("interval", &time_frame);
 
+    let historical_candles_required = if macd_trend_ma.unwrap_or(0) > slow_ma.unwrap_or(0) {
+        macd_trend_ma.unwrap_or(0).to_string()
+    } else {
+        slow_ma.unwrap().to_string()
+    };
+
     // Get the last candle sticks that we need to compute current moving averages.
-    let nslow_ma = (slow_ma + 1).to_string();
-    req_params.insert("limit", &nslow_ma);
+    req_params.insert("limit", &historical_candles_required);
     if let Ok(st) = bex.get_server_time() {
         if let Ok(cd) = bex.get_cstick_data(&req_params) {
+            let mut idx = 0;
             for stick in cd.iter() {
                 if let Ok(closing_price) = stick.close_price.parse::<f64>() {
                     if st >= stick.close_time {
                         // Candle stick is closed, we can use it for ma calculation.
+                        prev_closing_price = if idx > 0 {
+                            Some(cd[idx - 1].close_price.parse::<f64>().unwrap())
+                        } else {
+                            None
+                        };
+
+                        idx += 1;
+
                         process_close_data(
+                            &am,
                             &tp,
                             &mut mt,
                             closing_price,
-                            Some(&tx_channel),
-                            ma_mode,
-                            ema,
-                            &signals,
+                            prev_closing_price,
+                            false,
                         );
+                        prev_closing_price = Some(closing_price);
                     }
                 } else {
                     error!(
@@ -251,12 +416,12 @@ fn process_market_data_thread(
             }
         } else {
             error!("{:?} failed to get cstick data, exiting", tp.symbol());
-            exit_trading_thread(&tx_channel);
+            am.exit();
             return;
         }
     } else {
         error!("{:?} failed to get server time, exiting", tp.symbol());
-        exit_trading_thread(&tx_channel);
+        am.exit();
         return;
     }
 
@@ -268,12 +433,9 @@ fn process_market_data_thread(
         time_frame
     );
     let mut ws_client = ClientBuilder::new(&stream).unwrap();
-    let mut conn = ws_client.connect(None).unwrap();
-    info!("connected to {:?}", stream);
+    let mut conn = reconnect_stream(&mut ws_client).expect("failed to connect to stream");
 
-    let mut running = true;
-
-    while running {
+    loop {
         match conn.recv_message() {
             Ok(om) => {
                 match om {
@@ -294,19 +456,18 @@ fn process_market_data_thread(
 
                             if closing_price > -1.0 {
                                 process_close_data(
+                                    &am,
                                     &tp,
                                     &mut mt,
                                     closing_price,
-                                    Some(&tx_channel),
-                                    ma_mode,
-                                    ema,
-                                    &signals,
+                                    prev_closing_price,
+                                    true,
                                 );
                             } else {
-                                error!("failed to parse closing price: {:?}", cstick_data);
+                                error!("failed to parse closing price: {}", cstick_data);
                             }
                         } else {
-                            error!("failed to deserialize candlestick data: {:?}", s);
+                            error!("failed to deserialize candlestick data: {}", s);
                         }
                     }
 
@@ -315,7 +476,7 @@ fn process_market_data_thread(
                             debug!("sent kline pong");
                         }
                         Err(e) => {
-                            error!("failed to reply to ping message: {:?}", e);
+                            error!("failed to reply to ping message: {}", e);
                         }
                     },
 
@@ -327,26 +488,17 @@ fn process_market_data_thread(
                     OwnedMessage::Binary(_) => {}
 
                     OwnedMessage::Close(e) => {
-                        info!("disconnected {:?}", e);
-                        let mut cur_try = 0;
-                        running = false;
-                        while cur_try < 5 {
-                            cur_try += 1;
-                            if let Ok(c) = ws_client.connect(None) {
-                                conn = c;
-                                running = true;
-                                break;
-                            } else {
-                                error!("failed to reconnect to {:?}: {:?}", stream, e);
-                                thread::sleep(time::Duration::from_millis(5000));
-                            }
-                        }
+                        info!("disconnected from kline stream: {:?}", e);
+                        match reconnect_stream(&mut ws_client) {
+                            Some(c) => conn = c,
+                            None => break,
+                        };
                     }
                 }
             }
 
             Err(e) => {
-                error!("error receiving data from the websocket: {:?}", e);
+                error!("failed to receive data from the websocket: {}", e);
             }
         }
     }
@@ -358,7 +510,7 @@ fn process_market_data_thread(
         }
     }
 
-    exit_trading_thread(&tx_channel);
+    am.exit();
 }
 
 // This function just spawns another 4 threads, 3 of those threads handle
@@ -375,25 +527,28 @@ fn process_market_data_thread(
 // trading thread can set stop loss orders.
 fn md_bvlt_process_thread(
     ec: ExchangeConfig,
+    log_dir: String,
     symset: String,
     time_frame: String,
-    slow_ma: u16,
-    fast_ma: u16,
+    slow_ma: Option<u16>,
+    fast_ma: Option<u16>,
     split_pct: u8,
-    stop_percent: f64,
+    stop_percent: Option<f64>,
+    take_profit_percent: Option<f64>,
     ema: bool,
-    signals: &Vec<TradeSignal>,
+    signal: TradeSignal,
     order_type: order::OrderType,
     limit_offset: Option<u8>,
+    confirmation_candles: Option<u8>,
+    macd_trend_ma: Option<u16>,
 ) {
-    info!("starting {}ma bvlt thread for: {:#} using time frame: {:#}, slow sticks: {:#}, fast sticks: {:#}, split {:#?}%, stop_pct: {:#?}",
+    info!("starting {}ma bvlt thread for: {} using time frame: {}, slow ma: {:?}, fast ma: {:?}, split {}%, stop_pct: {:?}%",
         if ema { "e" } else { "s" }, symset, time_frame, slow_ma, fast_ma, split_pct, stop_percent);
 
     let pairs: Vec<&str> = symset.split(":").collect();
     let n_ma_threads = pairs.len();
     assert!(n_ma_threads == 3);
     let mut handles = Vec::with_capacity(n_ma_threads);
-    let (tx, rx) = mpsc::channel::<TradeThreadMsg>();
     let mut base_trading_pair: Option<TradingPair> = None;
     let bex = Binance::new(ec.clone());
     for symbol in pairs {
@@ -406,20 +561,25 @@ fn md_bvlt_process_thread(
         }
 
         let time_frame = time_frame.clone();
-        let txc = tx.clone();
         let ma_ec = ec.clone();
-        let sigs = signals.clone();
+        let log_dir = log_dir.clone();
         let h = thread::spawn(move || {
             process_market_data_thread(
                 ma_ec,
+                log_dir,
                 trading_pair,
                 time_frame,
                 slow_ma,
                 fast_ma,
-                txc,
-                ma::MAMode::BVLT,
+                true,
                 ema,
-                sigs,
+                signal,
+                order_type,
+                limit_offset,
+                stop_percent,
+                take_profit_percent,
+                confirmation_candles,
+                macd_trend_ma,
             );
         });
 
@@ -427,106 +587,85 @@ fn md_bvlt_process_thread(
     }
 
     assert!(base_trading_pair.is_some());
-    // Create the trading thread.
-
-    let ec = ec.clone();
-    let trade_thread_handle = thread::spawn(move || {
-        trading::bvlt_trading_thread(
-            ec,
-            base_trading_pair.unwrap(),
-            rx,
-            split_pct,
-            stop_percent,
-            order_type,
-            limit_offset,
-        );
-    });
-
-    // Sleep until all spawned threads exit.
-    for h in handles {
-        h.join().unwrap();
-    }
-
-    trade_thread_handle.join().unwrap();
 }
 
 // Spawns a data processing thread for processing market data and a trading thread
 // for executing trades.
 fn md_process_thread(
     ec: ExchangeConfig,
+    log_dir: String,
     symbol: String,
     time_frame: String,
-    slow_ma: u16,
-    fast_ma: u16,
+    slow_ma: Option<u16>,
+    fast_ma: Option<u16>,
     split_pct: u8,
-    stop_percent: f64,
+    stop_percent: Option<f64>,
+    take_profit_percent: Option<f64>,
     ema: bool,
-    signals: &Vec<TradeSignal>,
-    short: bool,
-    leverage: Option<f64>,
+    signal: TradeSignal,
     order_type: order::OrderType,
     limit_offset: Option<u8>,
+    confirmation_candles: Option<u8>,
+    macd_trend_ma: Option<u16>,
 ) {
-    info!("starting {}ma basic thread for: {:#} using time frame: {:#}, slow sticks: {:#}, fast sticks: {:#}, split {:#?}%, stop_percent: {:#?}, short selling: {:#?}",
-        if ema { "e" } else { "s" }, symbol, time_frame, slow_ma, fast_ma, split_pct, stop_percent, short);
+    info!("starting {}ma basic thread for: {} using time frame: {}, slow ma: {:?}, fast ma: {:?}, split: {}%, stop_percent: {:?}%",
+        if ema { "e" } else { "s" }, symbol, time_frame, slow_ma, fast_ma, split_pct, stop_percent);
 
-    let (tx, rx) = mpsc::channel::<TradeThreadMsg>();
     let bex = Binance::new(ec.clone());
     let trading_pair = TradingPair::new(&bex, &symbol);
-    let ma_ec = ec.clone();
     let tp = trading_pair.clone();
-    let sigs = signals.clone();
+    let log_dir = log_dir.clone();
     let handle = thread::spawn(move || {
         process_market_data_thread(
             ec,
+            log_dir,
             tp,
             time_frame,
             slow_ma,
             fast_ma,
-            tx,
-            ma::MAMode::BASIC,
+            false,
             ema,
-            sigs,
-        );
-    });
-
-    let tp = trading_pair.clone();
-    let trade_thread_handle = thread::spawn(move || {
-        trading::trading_thread(
-            ma_ec,
-            tp,
-            rx,
-            split_pct,
-            stop_percent,
-            short,
-            leverage,
+            signal,
             order_type,
             limit_offset,
+            stop_percent,
+            take_profit_percent,
+            confirmation_candles,
+            macd_trend_ma,
         );
     });
 
     // Sleep until all spawned threads exit.
     handle.join().unwrap();
-    trade_thread_handle.join().unwrap();
 }
 
-// Main non BVLT based strategy, here we monitor various signals on
-// a single trading pair then signal buy/sell to the trading thread.
-pub fn run_strategy(strat_cfg: &StrategyConfig, ec: &ExchangeConfig) {
+pub fn run_strategy(strat_cfg: &StrategyConfig, log_dir: &str, ec: &ExchangeConfig) {
     // Parse configuration first.
-    let slow_ma: u16 = strat_cfg
-        .members
-        .get("Slow")
-        .expect("Missing \"Slow\" configuration")
-        .parse()
-        .expect("Failed to parse \"Slow\" configuration");
+    let slow_ma = match strat_cfg.members.get("SlowMA") {
+        Some(slow_ma) => {
+            let slow_ma = slow_ma
+                .to_string()
+                .parse::<u16>()
+                .expect("SlowMA is not valid");
 
-    let fast_ma: u16 = strat_cfg
-        .members
-        .get("Fast")
-        .expect("Missing \"Fast\" configuration")
-        .parse()
-        .expect("Failed to parse \"Fast\" configuration");
+            Some(slow_ma)
+        }
+
+        None => None,
+    };
+
+    let fast_ma = match strat_cfg.members.get("FastMA") {
+        Some(fast_ma) => {
+            let fast_ma = fast_ma
+                .to_string()
+                .parse::<u16>()
+                .expect("FastMA is not valid");
+
+            Some(fast_ma)
+        }
+
+        None => None,
+    };
 
     let time_frame = strat_cfg
         .members
@@ -556,26 +695,11 @@ pub fn run_strategy(strat_cfg: &StrategyConfig, ec: &ExchangeConfig) {
         .parse::<bool>()
         .unwrap();
 
-    // Which signals to watch for.
-    let signals_cfg: Vec<&str> = strat_cfg
+    // Which signal to watch for.
+    let signal = strat_cfg
         .members
-        .get("Signals")
-        .expect("Missing \"Signals\" configuration")
-        .split(",")
-        .collect();
-
-    // Enable short selling on down trend signals.
-    let short: bool = strat_cfg
-        .members
-        .get("Short")
-        .unwrap_or(&"false".to_string())
-        .parse::<bool>()
-        .unwrap();
-
-    // BVLT always shorts right now.
-    if bvlt_mode && !short {
-        panic!("BVLT mode does not support Short=false");
-    }
+        .get("Signal")
+        .expect("Missing \"Signal\" configuration");
 
     // Market or limit orders to be used.
     let ot = match strat_cfg.members.get("OrderType") {
@@ -606,55 +730,88 @@ pub fn run_strategy(strat_cfg: &StrategyConfig, ec: &ExchangeConfig) {
         _ => None,
     };
 
-    // Enable leveraged trading via the margin API.
-    let leverage = match strat_cfg.members.get("Leverage") {
-        Some(l) => {
-            if l.eq_ignore_ascii_case("none") {
-                None
-            } else {
-                Some(l.parse::<f64>().expect("failed to parse {:?} as f64"))
+    // Stops with margin is not currently supported.
+    let stop_percent = match strat_cfg.members.get("StopPercent") {
+        Some(o) => {
+            let stop_percent = o
+                .to_string()
+                .parse::<f64>()
+                .expect("StopPercent should be >= 0.0 <= 100.0");
+            if stop_percent <= 0.0 || stop_percent > 100.0 {
+                panic!("StopPercent should be a percentage");
             }
+
+            Some(stop_percent)
         }
 
         None => None,
     };
 
-    // Stops with margin is not currently supported.
-    let stop_percent = match strat_cfg.members.get("StopPercent") {
+    // Take profit percent.
+    let tp_percent = match strat_cfg.members.get("TakeProfitPercent") {
         Some(o) => {
-            let stop_price = o
+            let tp_percent = o
                 .to_string()
                 .parse::<f64>()
-                .expect("StopPercent should be >= 0.0 <= 100.0");
-            if stop_price < 0.0 || stop_price > 100.0 {
-                panic!("StopPercent should be a percentage");
+                .expect("TakeProfitPercent should be >= 0.0 <= 100.0");
+            if tp_percent <= 0.0 || tp_percent > 100.0 {
+                panic!("TakeProfitPercent should be a percentage");
             }
 
-            if leverage.is_some() || (short && !bvlt_mode) {
-                panic!("StopPercent not currently supported when using leverage or shorts");
-            }
-
-            stop_price
+            Some(tp_percent)
         }
 
-        None => 1.0,
+        None => None,
     };
 
-    // BVLT always shorts right now.
-    if bvlt_mode && leverage.is_some() {
-        panic!("BVLT mode is already using leverage, remove \"Leverage\" configuration");
-    }
-
-    let mut signals: Vec<TradeSignal> = Vec::with_capacity(signals_cfg.len());
-    for signal in signals_cfg {
+    let signal = {
         if signal.eq_ignore_ascii_case("trend") {
-            signals.push(TradeSignal::MaTrendReversal);
+            TradeSignal::MaTrendReversal
         } else if signal.eq_ignore_ascii_case("cross") {
-            signals.push(TradeSignal::MaCross);
+            TradeSignal::MaCross
         } else if signal.eq_ignore_ascii_case("macd") {
-            signals.push(TradeSignal::MACD);
+            TradeSignal::MACD
+        } else {
+            panic!("Unsupported signal: {}", signal);
         }
-    }
+    };
+
+    let confirmation_candles = match strat_cfg.members.get("ConfirmationCandles") {
+        Some(confirmation_candles) => {
+            let confirmation_candles = confirmation_candles
+                .to_string()
+                .parse::<u8>()
+                .expect("ConfirmationCandles is not a number");
+            if confirmation_candles > 10 {
+                panic!("ConfirmationCandles < 10");
+            }
+
+            if signal != TradeSignal::MACD {
+                panic!("ConfirmationCandles is set but macd is not configured as a strategy")
+            }
+
+            Some(confirmation_candles)
+        }
+
+        None => None,
+    };
+
+    let macd_trend_ma = match strat_cfg.members.get("MacdTrendMa") {
+        Some(macd_trend_ma) => {
+            let macd_trend_ma = macd_trend_ma
+                .to_string()
+                .parse::<u16>()
+                .expect("MacdTrendMa is not a number");
+
+            if signal != TradeSignal::MACD {
+                panic!("MacdTrendMa is set but macd is not configured as a strategy")
+            }
+
+            Some(macd_trend_ma)
+        }
+
+        None => None,
+    };
 
     // If have one set of symbols then we invest 100% in that, if we
     // have 2 sets of symbols then each gets 50% and so on....
@@ -675,40 +832,46 @@ pub fn run_strategy(strat_cfg: &StrategyConfig, ec: &ExchangeConfig) {
         let time_frame = time_frame.to_string();
         let ec = ec.clone();
         let symbol = pair.to_owned();
-        let sigs = signals.clone();
+        let log_dir = log_dir.to_string();
         let h = if bvlt_mode {
             let symset = pair.to_string();
             thread::spawn(move || {
                 md_bvlt_process_thread(
                     ec,
+                    log_dir,
                     symset,
                     time_frame,
                     slow_ma,
                     fast_ma,
                     asset_split_pct,
                     stop_percent,
+                    tp_percent,
                     ema,
-                    &sigs,
+                    signal,
                     order_type,
                     limit_range,
+                    confirmation_candles,
+                    macd_trend_ma,
                 );
             })
         } else {
             thread::spawn(move || {
                 md_process_thread(
                     ec,
+                    log_dir.to_string(),
                     symbol,
                     time_frame,
                     slow_ma,
                     fast_ma,
                     asset_split_pct,
                     stop_percent,
+                    tp_percent,
                     ema,
-                    &sigs,
-                    short,
-                    leverage,
+                    signal,
                     order_type,
                     limit_range,
+                    confirmation_candles,
+                    macd_trend_ma,
                 );
             })
         };

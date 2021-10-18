@@ -3,7 +3,9 @@ use sha2::Sha256;
 
 use std::collections::HashMap;
 
-use flexi_logger::{detailed_format, Age, Cleanup, Criterion, Duplicate, Logger, Naming};
+use flexi_logger::{
+    colored_detailed_format, Age, Cleanup, Criterion, Duplicate, FileSpec, Logger, Naming,
+};
 
 fn get_hmac(secret: &str, input: &str) -> String {
     type HmacSha256 = Hmac<Sha256>;
@@ -23,11 +25,21 @@ pub fn sign_query(secret: &str, query_params: &HashMap<&str, &str>) -> String {
     get_hmac(secret, &querystr)
 }
 
+pub fn decimal_places(input: &str) -> u8 {
+    let trim_zeros = input.trim_end_matches("0");
+    let whole_and_decimal: Vec<&str> = trim_zeros.split(".").collect();
+    if whole_and_decimal.len() == 1 {
+        0 as u8
+    } else {
+        whole_and_decimal[1].len() as u8
+    }
+}
+
 pub fn init_logging(logdir: &str, logspec: &str) {
-    Logger::with_str(logspec)
-        .log_to_file()
-        .directory(logdir)
-        .format(detailed_format)
+    Logger::try_with_str(logspec)
+        .unwrap()
+        .log_to_file(FileSpec::default().directory(logdir))
+        .format(colored_detailed_format)
         .duplicate_to_stdout(Duplicate::Info)
         .create_symlink("current.log")
         .rotate(

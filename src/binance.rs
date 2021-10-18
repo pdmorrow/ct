@@ -6,11 +6,10 @@ use crate::exchangeinfo::{LotSizeFilter, PriceFilter};
 use crate::order;
 use crate::orderbook::OrderBook;
 use crate::price::Price;
-use crate::tradingpair::TradingPair;
 use crate::utils;
 
 use account::{Account, IsolatedMarginAccount};
-use order::{OrderResponse, OrderResponseAck, ShortOrderResponse};
+use order::{OrderResponseAck, ShortOrderResponse};
 
 use log::error;
 use std::collections::HashMap;
@@ -24,7 +23,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub enum BinanceErrorCode {
     #[allow(dead_code)]
     InsufficientBalance = -2010,
-    UnknownOrderSent = -2011,
 }
 
 #[allow(dead_code)]
@@ -58,7 +56,7 @@ impl Binance {
     fn post(
         &self,
         endpoint: &str,
-        params: &HashMap<&str, &str>,
+        params: Option<&HashMap<&str, &str>>,
         config: &ExchangeConfig,
         sign: bool,
         margin: bool,
@@ -91,13 +89,70 @@ impl Binance {
 
         let client = self.get_blocking_client();
 
-        let req = client
-            .post(&uri)
-            .header("X-MBX-APIKEY", &config.apikey)
-            .query(&params);
+        let req = if params.is_some() {
+            client
+                .post(&uri)
+                .header("X-MBX-APIKEY", &config.apikey)
+                .query(&params)
+        } else {
+            client.post(&uri).header("X-MBX-APIKEY", &config.apikey)
+        };
 
-        if sign {
-            let hmac = utils::sign_query(&self.config.secretkey, &params);
+        if sign && params.is_some() {
+            let hmac = utils::sign_query(&self.config.secretkey, params.unwrap());
+            req.query(&[("signature", &hmac)]).send()
+        } else {
+            req.send()
+        }
+    }
+
+    fn put(
+        &self,
+        endpoint: &str,
+        params: Option<&HashMap<&str, &str>>,
+        config: &ExchangeConfig,
+        sign: bool,
+        margin: bool,
+        isolated: bool,
+    ) -> Result<reqwest::blocking::Response, reqwest::Error> {
+        if isolated {
+            assert!(margin);
+        }
+
+        let uri = match margin {
+            true => match isolated {
+                true => {
+                    format!(
+                        "{}/{}/margin/isolated/{}",
+                        config.uri, config.margin_version, endpoint
+                    )
+                }
+                false => {
+                    format!(
+                        "{}/{}/margin/{}",
+                        config.uri, config.margin_version, endpoint
+                    )
+                }
+            },
+
+            false => {
+                format!("{}/{}/{}", config.uri, config.version, endpoint)
+            }
+        };
+
+        let client = self.get_blocking_client();
+
+        let req = if params.is_some() {
+            client
+                .put(&uri)
+                .header("X-MBX-APIKEY", &config.apikey)
+                .query(&params)
+        } else {
+            client.put(&uri).header("X-MBX-APIKEY", &config.apikey)
+        };
+
+        if sign && params.is_some() {
+            let hmac = utils::sign_query(&self.config.secretkey, params.unwrap());
             req.query(&[("signature", &hmac)]).send()
         } else {
             req.send()
@@ -282,7 +337,7 @@ impl Binance {
             }
         }
 
-        match self.post("transfer", &params, &config, true, true, true) {
+        match self.post("transfer", Some(&params), &config, true, true, true) {
             Ok(s) => {
                 if s.status().is_success() {
                     let j: serde_json::Value = serde_json::from_str(&s.text().unwrap()).unwrap();
@@ -292,7 +347,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -330,7 +385,7 @@ impl Binance {
             }
         }
 
-        match self.post("transfer", &params, &config, true, true, false) {
+        match self.post("transfer", Some(&params), &config, true, true, false) {
             Ok(s) => {
                 if s.status().is_success() {
                     let j: serde_json::Value = serde_json::from_str(&s.text().unwrap()).unwrap();
@@ -340,7 +395,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -351,6 +406,7 @@ impl Binance {
         }
     }
 
+    #[allow(dead_code)]
     pub fn margin_repay(
         &self,
         asset: &str,
@@ -384,7 +440,7 @@ impl Binance {
         let amount_str = amount.to_string();
         params.insert("amount", &amount_str);
 
-        match self.post(repay_ep, &params, &config, true, true, false) {
+        match self.post(repay_ep, Some(&params), &config, true, true, false) {
             Ok(s) => {
                 if s.status().is_success() {
                     let j: serde_json::Value = serde_json::from_str(&s.text().unwrap()).unwrap();
@@ -394,7 +450,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -439,7 +495,7 @@ impl Binance {
         let amount_str = amount.to_string();
         params.insert("amount", &amount_str);
 
-        match self.post(borrow_ep, &params, &config, true, true, false) {
+        match self.post(borrow_ep, Some(&params), &config, true, true, false) {
             Ok(s) => {
                 if s.status().is_success() {
                     let j: serde_json::Value = serde_json::from_str(&s.text().unwrap()).unwrap();
@@ -449,7 +505,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -460,6 +516,7 @@ impl Binance {
         }
     }
 
+    #[allow(dead_code)]
     pub fn margin_cancel_all_orders(
         &self,
         symbol: &str,
@@ -498,7 +555,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -509,6 +566,7 @@ impl Binance {
         }
     }
 
+    #[allow(dead_code)]
     pub fn get_isolated_margin_account_data(
         &self,
         symbols: &str,
@@ -543,7 +601,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -554,6 +612,7 @@ impl Binance {
         }
     }
 
+    #[allow(dead_code)]
     pub fn send_short_order(
         &self,
         params: &HashMap<&str, &str>,
@@ -569,18 +628,17 @@ impl Binance {
             }
         };
 
-        match self.post(&order_ep, &params, &config, true, true, false) {
+        match self.post(&order_ep, Some(&params), &config, true, true, false) {
             Ok(s) => {
                 if s.status().is_success() {
                     let or: ShortOrderResponse = s.json().unwrap();
                     return Ok(or);
                 }
 
-                let text = &s.text().unwrap();
-                error!("failed to send margin order for {:#?}: {:#?}", params, text);
-
                 // Return the status code from binance.
+                let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -591,6 +649,7 @@ impl Binance {
         }
     }
 
+    #[allow(dead_code)]
     pub fn send_margin_order(
         &self,
         params: &HashMap<&str, &str>,
@@ -606,7 +665,7 @@ impl Binance {
             }
         };
 
-        match self.post(&order_ep, &params, &config, true, true, false) {
+        match self.post(&order_ep, Some(&params), &config, true, true, false) {
             Ok(s) => {
                 if s.status().is_success() {
                     let or: ShortOrderResponse = s.json().unwrap();
@@ -616,6 +675,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -629,6 +689,111 @@ impl Binance {
     /**************************************************************************
      * SPOT ROUTINES. *********************************************************
      *************************************************************************/
+    pub fn create_listen_key(&self) -> Result<String, i64> {
+        let config = self.get_config();
+        let order_ep = match config.endpoints_map.get(&String::from("SPOT_USER_STREAM")) {
+            Some(ep) => ep,
+            None => {
+                panic!(
+                    "no SPOT_USER_STREAM endpoint configured for exchange {:#?}",
+                    config.name
+                );
+            }
+        };
+
+        match self.post(&order_ep, None, &config, false, false, false) {
+            Ok(s) => {
+                if s.status().is_success() {
+                    let text = &s.text().unwrap();
+                    let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                    let escaped_str = j["listenKey"].to_string();
+                    return Ok(serde_json::from_str(&escaped_str).unwrap());
+                }
+
+                // Return the status code from binance.
+                let text = &s.text().unwrap();
+                let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                error!("{}", text);
+                return Err(j["code"].as_i64().unwrap());
+            }
+
+            Err(e) => {
+                error!("failed to send create listen key request: {:#?}", e);
+                return Err(-1);
+            }
+        }
+    }
+
+    pub fn ping_listen_key(&self, listen_key: String) -> Result<(), i64> {
+        let config = self.get_config();
+        let order_ep = match config.endpoints_map.get(&String::from("SPOT_USER_STREAM")) {
+            Some(ep) => ep,
+            None => {
+                panic!(
+                    "no SPOT_USER_STREAM endpoint configured for exchange {:#?}",
+                    config.name
+                );
+            }
+        };
+
+        let mut params: HashMap<&str, &str> = HashMap::new();
+        params.insert("listenKey", &listen_key);
+
+        match self.put(&order_ep, Some(&params), &config, false, false, false) {
+            Ok(s) => {
+                if s.status().is_success() {
+                    return Ok(());
+                }
+
+                // Return the status code from binance.
+                let text = &s.text().unwrap();
+                let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                error!("{}", text);
+                return Err(j["code"].as_i64().unwrap());
+            }
+
+            Err(e) => {
+                error!("failed to send refresh listen key request: {:#?}", e);
+                return Err(-1);
+            }
+        }
+    }
+
+    pub fn delete_listen_key(&self, listen_key: String) -> Result<(), i64> {
+        let config = self.get_config();
+        let order_ep = match config.endpoints_map.get(&String::from("SPOT_USER_STREAM")) {
+            Some(ep) => ep,
+            None => {
+                panic!(
+                    "no SPOT_USER_STREAM endpoint configured for exchange {:#?}",
+                    config.name
+                );
+            }
+        };
+
+        let mut params: HashMap<&str, &str> = HashMap::new();
+        params.insert("listenKey", &listen_key);
+
+        match self.delete(&order_ep, &params, &config, false, false, false) {
+            Ok(s) => {
+                if s.status().is_success() {
+                    return Ok(());
+                }
+
+                // Return the status code from binance.
+                let text = &s.text().unwrap();
+                let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                error!("{}", text);
+                return Err(j["code"].as_i64().unwrap());
+            }
+
+            Err(e) => {
+                error!("failed to send delete listen key request: {:#?}", e);
+                return Err(-1);
+            }
+        }
+    }
+
     pub fn send_stop_order(&self, params: &HashMap<&str, &str>) -> Result<OrderResponseAck, i64> {
         let config = self.get_config();
         let order_ep = match config.endpoints_map.get(&String::from("ORDER")) {
@@ -641,7 +806,7 @@ impl Binance {
             }
         };
 
-        match self.post(&order_ep, &params, &config, true, false, false) {
+        match self.post(&order_ep, Some(&params), &config, true, false, false) {
             Ok(s) => {
                 if s.status().is_success() {
                     let or: OrderResponseAck = s.json().unwrap();
@@ -651,7 +816,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -664,9 +829,9 @@ impl Binance {
 
     pub fn send_order(
         &self,
-        params: &HashMap<&str, &str>,
+        params: &mut HashMap<&str, &str>,
         margin: bool,
-    ) -> Result<OrderResponse, i64> {
+    ) -> Result<OrderResponseAck, i64> {
         let config = self.get_config();
         let order_ep = match config.endpoints_map.get(&String::from("ORDER")) {
             Some(ep) => ep,
@@ -678,10 +843,12 @@ impl Binance {
             }
         };
 
-        match self.post(&order_ep, &params, &config, true, margin, false) {
+        params.insert("newOrderRespType", "ACK");
+
+        match self.post(&order_ep, Some(&params), &config, true, margin, false) {
             Ok(s) => {
                 if s.status().is_success() {
-                    let or: OrderResponse = s.json().unwrap();
+                    let or: OrderResponseAck = s.json().unwrap();
                     return Ok(or);
                 }
 
@@ -690,7 +857,7 @@ impl Binance {
 
                 // Return the status code from binance.
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -703,11 +870,11 @@ impl Binance {
 
     pub fn cancel_all_orders(&self, symbol: &str) -> Result<serde_json::Value, i64> {
         let config = self.get_config();
-        let co_ep = match config.endpoints_map.get(&String::from("CANCEL_OPEN")) {
+        let co_ep = match config.endpoints_map.get(&String::from("OPEN_ORDERS")) {
             Some(ep) => ep,
             None => {
                 panic!(
-                    "no CANCEL_OPEN endpoint configured for exchange {:#?}",
+                    "no OPEN_ORDERS endpoint configured for exchange {:#?}",
                     config.name
                 );
             }
@@ -732,7 +899,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -743,18 +910,55 @@ impl Binance {
         }
     }
 
+    pub fn get_open_orders(&self, symbol: &str) -> Result<serde_json::Value, i64> {
+        let config = self.get_config();
+        let co_ep = match config.endpoints_map.get(&String::from("OPEN_ORDERS")) {
+            Some(ep) => ep,
+            None => {
+                panic!(
+                    "no OPEN_ORDERS endpoint configured for exchange {:#?}",
+                    config.name
+                );
+            }
+        };
+
+        let mut params: HashMap<&str, &str> = HashMap::new();
+        let ts_now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("Time went backwards")
+            .as_millis() as u64;
+        let t = ts_now.to_string();
+        params.insert("timestamp", &t);
+        params.insert("symbol", symbol);
+
+        match self.get(&co_ep, Some(&params), &config, true, false, false) {
+            Ok(s) => {
+                if s.status().is_success() {
+                    let v: serde_json::Value = serde_json::from_str(&s.text().unwrap()).unwrap();
+                    return Ok(v);
+                }
+
+                // Return the status code from binance.
+                let text = &s.text().unwrap();
+                let j: serde_json::Value = serde_json::from_str(text).unwrap();
+                error!("{}", text);
+                return Err(j["code"].as_i64().unwrap());
+            }
+
+            Err(e) => {
+                error!("failed to get open orders: {:#?}", e);
+                return Err(-1);
+            }
+        }
+    }
+
     pub fn get_lot_size_filter(&self, symbol: &str) -> Result<LotSizeFilter, i64> {
         match self.get_exchange_info(Some(symbol)) {
             Ok(ei) => {
                 let sym = &ei["symbols"][0];
                 let lot_size_filter = &sym["filters"][2];
-                let step_size = lot_size_filter["stepSize"]
-                    .as_str()
-                    .unwrap()
-                    .parse::<f64>()
-                    .unwrap();
-                let step_size_str = step_size.to_string();
-                let whole_and_decimal: Vec<&str> = step_size_str.split(".").collect();
+                let step_size = lot_size_filter["stepSize"].as_str().unwrap();
+                let decimal_places = utils::decimal_places(&step_size) as i8;
 
                 return Ok(LotSizeFilter {
                     min_qty: lot_size_filter["minQty"]
@@ -767,8 +971,8 @@ impl Binance {
                         .unwrap()
                         .parse::<f64>()
                         .unwrap(),
-                    step_size: step_size,
-                    decimal_places: whole_and_decimal[1].len() as i8,
+                    step_size: step_size.parse::<f64>().unwrap(),
+                    decimal_places: decimal_places,
                 });
             }
 
@@ -858,61 +1062,12 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
             Err(e) => {
                 error!("failed to get exchange info: {:#?}", e);
-                return Err(-1);
-            }
-        }
-    }
-
-    #[allow(dead_code)]
-    pub fn get_all_orders(&self, tp: &TradingPair, limit: u16) -> Result<Vec<OrderResponse>, i64> {
-        let config = self.get_config();
-        let all_orders_ep = match config.endpoints_map.get(&String::from("ALL_ORDERS")) {
-            Some(ep) => ep,
-            None => {
-                panic!(
-                    "no ALL_ORDERS endpoint configured for exchange {:#?}",
-                    config.name
-                );
-            }
-        };
-
-        let mut params: HashMap<&str, &str> = HashMap::new();
-        let ts_now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("Time went backwards")
-            .as_millis() as u64;
-        let t = ts_now.to_string();
-        params.insert("timestamp", &t);
-        params.insert("symbol", tp.symbol());
-        let ls = limit.to_string();
-        params.insert("limit", &ls);
-
-        match self.get_retries(&all_orders_ep, Some(&params), &config, true, false, false) {
-            Ok(s) => {
-                if s.status().is_success() {
-                    let orders: Vec<OrderResponse> = s.json().unwrap();
-                    if orders.len() > 0 {
-                        return Ok(orders);
-                    } else {
-                        return Err(-1);
-                    }
-                }
-
-                // Return the status code from binance.
-                let text = &s.text().unwrap();
-                let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
-                return Err(j["code"].as_i64().unwrap());
-            }
-
-            Err(e) => {
-                error!("failed to get all orders: {:#?}", e);
                 return Err(-1);
             }
         }
@@ -948,7 +1103,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -981,7 +1136,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -1025,7 +1180,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -1065,7 +1220,7 @@ impl Binance {
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -1076,7 +1231,7 @@ impl Binance {
         }
     }
 
-    pub fn get_price(&self, trading_pair: Option<&str>) -> Result<Vec<Price>, i64> {
+    pub fn get_price(&self, trading_pair: &str) -> Result<Price, i64> {
         let config = self.get_config();
         let price_ep = match config.endpoints_map.get(&String::from("PRICE")) {
             Some(ep) => ep,
@@ -1089,32 +1244,20 @@ impl Binance {
         };
 
         let mut params: HashMap<&str, &str> = HashMap::with_capacity(1);
-        match trading_pair {
-            Some(tp) => {
-                params.insert("symbol", tp);
-            }
-            None => {}
-        }
+        params.insert("symbol", trading_pair);
 
         match self.get_retries(&price_ep, Some(&params), &config, false, false, false) {
             Ok(s) => {
                 if s.status().is_success() {
-                    if params.len() == 1 {
-                        // A single price was requested.
-                        let p: Price = s.json().unwrap();
-                        // TODO: check we could deserialize.
-                        return Ok(vec![p]);
-                    } else {
-                        // All prices were requested.
-                        let all_prices: Vec<Price> = s.json().unwrap();
-                        return Ok(all_prices);
-                    }
+                    let p: Price = s.json().unwrap();
+                    // TODO: check we could deserialize.
+                    return Ok(p);
                 }
 
                 // Return the status code from binance.
                 let text = &s.text().unwrap();
                 let j: serde_json::Value = serde_json::from_str(text).unwrap();
-
+                error!("{}", text);
                 return Err(j["code"].as_i64().unwrap());
             }
 
@@ -1124,47 +1267,6 @@ impl Binance {
             }
         }
     }
-
-    #[allow(dead_code)]
-    pub fn get_prices(
-        &self,
-        trading_pairs: Option<&Vec<&str>>,
-    ) -> Result<HashMap<String, f64>, i64> {
-        let mut price_map: HashMap<String, f64> = HashMap::new();
-
-        match trading_pairs {
-            Some(tps) => {
-                // Get a subset of available prices from the exchange.
-                for tp in tps.iter() {
-                    match self.get_price(Some(tp)) {
-                        Ok(vp) => {
-                            let p = vp.get(0).unwrap();
-                            price_map.insert(p.symbol.clone(), p.price.parse::<f64>().unwrap());
-                        }
-                        Err(code) => {
-                            return Err(code);
-                        }
-                    }
-                }
-            }
-            None => {
-                // Get all prices from the exchange.
-                match self.get_price(None) {
-                    Ok(vp) => {
-                        for p in vp.iter() {
-                            price_map.insert(p.symbol.clone(), p.price.parse::<f64>().unwrap());
-                        }
-                    }
-
-                    Err(code) => {
-                        return Err(code);
-                    }
-                }
-            }
-        }
-
-        return Ok(price_map);
-    }
 }
 
 #[cfg(test)]
@@ -1172,6 +1274,8 @@ mod tests {
     use super::*;
 
     use crate::config;
+
+    use crate::tradingpair::TradingPair;
 
     use log::info;
 
@@ -1184,7 +1288,7 @@ mod tests {
         let tp = TradingPair::new(&bex, "ADA/USDT");
 
         // Price of BTCUPUSDT.
-        match bex.get_price(Some(tp.symbol())) {
+        match bex.get_price(tp.symbol()) {
             Ok(p) => {
                 info!("price: {:#?}", p);
             }

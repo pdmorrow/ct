@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use serde_json;
 
-#[derive(Serialize, Deserialize, Debug)]
+#[derive(Serialize, Deserialize, Debug, Default)]
 #[allow(non_snake_case)]
 pub struct Account {
     pub makerCommission: u32,
@@ -73,28 +73,4 @@ pub struct IsolatedAssetInfo {
 #[allow(non_snake_case)]
 pub struct IsolatedMarginAccount {
     pub assets: Vec<IsolatedAssetInfo>,
-}
-
-impl Account {
-    pub fn get_balance(&self, symbol: &str) -> Option<f64> {
-        let mut it = self
-            .balances
-            .iter()
-            .filter(|&b| b.asset.eq_ignore_ascii_case(symbol));
-        match it.next() {
-            Some(b) => Some(b.free.parse::<f64>().unwrap()),
-            None => None,
-        }
-    }
-
-    pub fn get_locked_balance(&self, symbol: &str) -> Option<f64> {
-        let mut it = self
-            .balances
-            .iter()
-            .filter(|&b| b.asset.eq_ignore_ascii_case(symbol));
-        match it.next() {
-            Some(b) => Some(b.locked.parse::<f64>().unwrap()),
-            None => None,
-        }
-    }
 }

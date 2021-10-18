@@ -21,6 +21,7 @@ pub struct ExchangeConfig {
 #[derive(Debug)]
 pub struct Config {
     pub log_level: String,
+    pub log_dir: String,
     pub strategy: StrategyConfig,
 }
 
@@ -106,7 +107,13 @@ pub fn new(cfg_file_path: &String) -> (Config, ExchangeConfig) {
     }
 
     // Parse [Manager] section, these are global options.
-    let log_level = match manager_section.get("Log") {
+    let log_level = match manager_section.get("LogLevel") {
+        Some(v) => v.to_ascii_lowercase(),
+
+        None => "info".to_string(),
+    };
+
+    let log_dir = match manager_section.get("LogDir") {
         Some(v) => v.to_ascii_lowercase(),
 
         None => "info".to_string(),
@@ -129,6 +136,7 @@ pub fn new(cfg_file_path: &String) -> (Config, ExchangeConfig) {
         Config {
             strategy: sc,
             log_level: log_level,
+            log_dir: log_dir,
         },
         ExchangeConfig {
             name: exchange_name.to_string(),

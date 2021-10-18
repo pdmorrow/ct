@@ -9,12 +9,6 @@ use log::{debug, info};
 use math::round;
 use std::collections::VecDeque;
 
-#[derive(Debug, Copy, Clone, PartialEq)]
-pub enum MAMode {
-    BVLT,  // Trade UP/DOWN coins based on the asset they track.
-    BASIC, // Trade the assest in a positive direction only.
-}
-
 #[derive(Debug)]
 pub struct MAData {
     latest: Option<f64>,                  // Current MA value.
@@ -99,6 +93,10 @@ impl MAData {
 
     // Compute the latest moving average value based on the close price.
     pub fn compute(&mut self, close_price: f64, ema: bool) {
+        if self.num_candles == 0 {
+            return;
+        }
+
         if self.acc.len() == self.num_candles as usize {
             // Discard the oldest close price we saved.
             self.acc.pop_back();
@@ -137,7 +135,8 @@ impl MAData {
 // MACD crossing signal line.
 pub fn trading_decision_macd(
     tp: &TradingPair,
-    mt: &mut process_md::MarketDataTracker,
+    mt: &process_md::MarketDataTracker,
+    closing_price: f64,
 ) -> PositionType {
     if mt.macd.macd_latest.is_some()
         && mt.macd.signal.latest().is_some()
@@ -148,39 +147,57 @@ pub fn trading_decision_macd(
         let macd = mt.macd.macd_latest.unwrap();
 
         debug!(
-            "[MACD] {:?}, MACD: {:?}, MACD_PREV: {:?}, SIGNAL: {:?}",
+            "[MACD] {}, CLOSE: {}, MACD: {}, MACD_PREV: {}, SIGNAL: {}",
             tp.symbol(),
+            closing_price,
             macd,
             macd_prev,
             signal,
         );
 
         if macd > signal && macd_prev < signal {
-            if mt.macd_signal != position::PositionType::Long {
+            if mt.macd_trend_ma.num_candles > 0 {
+                let trend_ma_prev = mt.macd_trend_ma.penultimate();
+                let trend_ma_latest = mt.macd_trend_ma.latest();
+
+                if trend_ma_latest.is_some() && trend_ma_prev.is_some() {
+                    if trend_ma_latest.unwrap() >= trend_ma_prev.unwrap() {
+                        // Trending up, we can take this long.
+                        info!(
+                            "[BUY][MACD] {}, close: {}, signal: MACD({}) > SIGNAL({}) > MACD_PREV({}) TREND_UP_MA({})",
+                            tp.symbol(),
+                            closing_price,
+                            macd,
+                            signal,
+                            macd_prev,
+                            mt.macd_trend_ma.num_candles,
+                        );
+                        return position::PositionType::Long;
+                    }
+                }
+
+                return position::PositionType::None;
+            } else {
                 info!(
-                    "[BUY][MACD] {:#?}, signal: MACD({:#?}) > SIGNAL({:#?}) > MACD_PREV({:?})",
+                    "[BUY][MACD] {}, close: {}, signal: MACD({}) > SIGNAL({}) > MACD_PREV({})",
                     tp.symbol(),
+                    closing_price,
                     macd,
                     signal,
                     macd_prev,
                 );
 
-                mt.macd_signal = position::PositionType::Long;
+                return position::PositionType::Long;
             }
-
-            return position::PositionType::Long;
         } else if macd < signal && macd_prev > signal {
-            if mt.macd_signal != position::PositionType::Short {
-                info!(
-                    "[SELL][MACD] {:#?}, signal: MACD({:#?}) < SIGNAL({:#?}) < MACD_PREV({:?})",
-                    tp.symbol(),
-                    macd,
-                    signal,
-                    macd_prev,
-                );
-
-                mt.macd_signal = position::PositionType::Short;
-            }
+            info!(
+                "[SELL][MACD] {}, close: {}, signal: MACD({}) < SIGNAL({}) < MACD_PREV({})",
+                tp.symbol(),
+                closing_price,
+                macd,
+                signal,
+                macd_prev,
+            );
 
             return position::PositionType::Short;
         }
@@ -194,7 +211,8 @@ pub fn trading_decision_macd(
 // PositionType::Short if the fast ma starts to trend downwards.
 pub fn trading_decision_ma_trend_change(
     tp: &TradingPair,
-    mt: &mut process_md::MarketDataTracker,
+    mt: &process_md::MarketDataTracker,
+    closing_price: f64,
 ) -> PositionType {
     if mt.slow_ma_data.latest().is_none()
         || mt.fast_ma_data.latest().is_none()
@@ -209,39 +227,36 @@ pub fn trading_decision_ma_trend_change(
     let pp = mt.fast_ma_data.penultimate_penultimate().unwrap();
 
     debug!(
-        "[MA][TREND] {:#?} FMA_PREV_PREV({:#?}) FMA_PREV({:#?}) FMA({:#?})",
+        "[MA][TREND] {} CLOSE({}) FMA_PREV_PREV({}) FMA_PREV({}) FMA({})",
         tp.symbol(),
+        closing_price,
         pp,
         p,
         c,
     );
 
     if c > p && p < pp {
-        if mt.ma_trend_change_signal != PositionType::Long {
-            info!(
-                "[BUY][TREND] {:#?}, signal: FMA({:#?}) > FMA_PREV({:#?}) and FMA_PREV({:#?}) < FMA_PREV_PREV({:#?})",
+        info!(
+                "[BUY][TREND] {}, close: {}, signal: FMA({}) > FMA_PREV({}) and FMA_PREV({}) < FMA_PREV_PREV({})",
                 tp.symbol(),
+                closing_price,
                 c,
                 p,
                 p,
                 pp,
             );
-            mt.ma_trend_change_signal = PositionType::Long;
-        }
 
         return PositionType::Long;
     } else if c < p && p > pp {
-        if mt.ma_trend_change_signal != PositionType::Short {
-            info!(
-                "[SELL][TREND] {:#?}, signal: FMA({:#?}) < FMA_PREV({:#?}) and FMA_PREV({:#?}) > FMA_PREV_PREV({:#?})",
+        info!(
+                "[SELL][TREND] {}, close: {}, signal: FMA({}) < FMA_PREV({}) and FMA_PREV({}) > FMA_PREV_PREV({})",
                 tp.symbol(),
+                closing_price,
                 c,
                 p,
                 p,
                 pp,
             );
-            mt.ma_trend_change_signal = PositionType::Short;
-        }
 
         return PositionType::Short;
     }
@@ -254,7 +269,8 @@ pub fn trading_decision_ma_trend_change(
 // PositionType::Short if the fast ma crosses the slow from above.
 pub fn trading_decision_ma_cross(
     tp: &TradingPair,
-    mt: &mut process_md::MarketDataTracker,
+    mt: &process_md::MarketDataTracker,
+    closing_price: f64,
 ) -> PositionType {
     if mt.fast_ma_data.latest().is_some()
         && mt.slow_ma_data.latest().is_some()
@@ -267,40 +283,35 @@ pub fn trading_decision_ma_cross(
         let s_ma_latest_val = round::floor(mt.slow_ma_data.latest().unwrap(), dps);
 
         debug!(
-            "[MA][CROSS] {:#?} FMA({:#?}) SMA({:#?})",
+            "[MA][CROSS] {:#?} CLOSE({}) FMA({}) SMA({})",
             tp.symbol(),
+            closing_price,
             f_ma_latest_val,
             s_ma_latest_val,
         );
 
         if f_ma_latest_val > s_ma_latest_val && f_ma_prev_val < s_ma_latest_val {
             // Fast moving average is above the slow moving average
-            if mt.ma_cross_signal != PositionType::Long {
-                info!(
-                    "[BUY][CROSS] {:#?}, signal: FMA({:#?}) > SMA({:#?} > FMA_PREV({:?})",
-                    tp.symbol(),
-                    f_ma_latest_val,
-                    s_ma_latest_val,
-                    f_ma_prev_val,
-                );
-
-                mt.ma_cross_signal = PositionType::Long;
-            }
+            info!(
+                "[BUY][CROSS] {:#?}, close: {}, signal: FMA({}) > SMA({} > FMA_PREV({})",
+                tp.symbol(),
+                closing_price,
+                f_ma_latest_val,
+                s_ma_latest_val,
+                f_ma_prev_val,
+            );
 
             return PositionType::Long;
         } else if f_ma_latest_val < s_ma_latest_val && f_ma_prev_val > s_ma_latest_val {
             // Fast moving average is below the slow moving average.
-            if mt.ma_cross_signal != PositionType::Short {
-                info!(
-                    "[SELL][CROSS] {:#?} signal: FMA({:#?}) < SMA({:#?}) < FMA_PREV({:?})",
-                    tp.symbol(),
-                    f_ma_latest_val,
-                    s_ma_latest_val,
-                    f_ma_prev_val,
-                );
-
-                mt.ma_cross_signal = PositionType::Short;
-            }
+            info!(
+                "[SELL][CROSS] {:#?}, close: {}, signal: FMA({}) < SMA({}) < FMA_PREV({})",
+                tp.symbol(),
+                closing_price,
+                f_ma_latest_val,
+                s_ma_latest_val,
+                f_ma_prev_val,
+            );
 
             return PositionType::Short;
         }

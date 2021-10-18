@@ -81,6 +81,7 @@ impl TradingPair {
         self.qty_dps
     }
 
+    #[allow(dead_code)]
     pub fn get_min_qty(&self) -> f64 {
         self.min_order
     }

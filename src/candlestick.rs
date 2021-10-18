@@ -47,3 +47,9 @@ pub struct CandleStickWs {
     pub s: String, // Symbol,
     pub k: KLine,  // KLine data.
 }
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub enum CandleColor {
+    GREEN,
+    RED,
+}
